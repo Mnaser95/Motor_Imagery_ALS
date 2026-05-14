@@ -1,0 +1,37 @@
+# Data folders - do not upload subject EEG data
+Sub*_data/
+EEG_Study/
+
+# Generated outputs
+outputs/
+figures/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.csv
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and environment files
+.venv/
+venv/
+env/
+ENV/
+*.env
+.env
+.env.*
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
