@@ -136,11 +136,10 @@ for subject_dir in subject_folders:
                     file_role = "Unknown_check"
 
                 # -----------------------------------------
-                # SAMPLE COUNTS
+                # SAMPLING RATE
                 # -----------------------------------------
 
-                mi_left_samples = int((trigger == 8).sum())
-                mi_right_samples = int((trigger == 9).sum())
+                sfreq = 300
 
                 # -----------------------------------------
                 # EVENT ONSETS ONLY
@@ -151,15 +150,52 @@ for subject_dir in subject_folders:
                     (trigger != 0)
                 ]
 
-                mi_left_trials = int((onsets == 8).sum())
-                mi_right_trials = int((onsets == 9).sum())
-                total_events = int(len(onsets))
+                # -----------------------------------------
+                # FIND END OF BASELINE PERIOD
+                # Markers 1-5 appear only during the
+                # pre-session baseline, never during the MI
+                # session. Any MI activity before the baseline
+                # ends is a pre-session artifact. Use the last
+                # row carrying a 1-5 marker as the cutoff.
+                # -----------------------------------------
+
+                baseline_rows = trigger[
+                    trigger.isin([1, 2, 3, 4, 5])
+                ].index
+
+                if len(baseline_rows) > 0:
+                    mi_onset_cutoff = baseline_rows[-1]
+                else:
+                    mi_onset_cutoff = trigger.index[0]
+
+                valid_onsets = onsets[onsets.index >= mi_onset_cutoff]
+
+                mi_left_trials = int((valid_onsets == 8).sum())
+                mi_right_trials = int((valid_onsets == 9).sum())
+                total_events = int(len(valid_onsets))
+
+                # -----------------------------------------
+                # SAMPLE COUNTS (last trial trimmed to 4 s)
+                # -----------------------------------------
+
+                mi_left_samples = int((trigger.loc[mi_onset_cutoff:] == 8).sum())
+                mi_right_samples = int((trigger.loc[mi_onset_cutoff:] == 9).sum())
+
+                max_trial_samples = int(4 * sfreq)
+
+                if len(valid_onsets) > 0:
+                    last_marker = valid_onsets.iloc[-1]
+                    last_pos = trigger.index.get_loc(valid_onsets.index[-1])
+                    if last_marker == 8:
+                        tail = int((trigger.iloc[last_pos:] == 8).sum())
+                        mi_left_samples -= max(0, tail - max_trial_samples)
+                    elif last_marker == 9:
+                        tail = int((trigger.iloc[last_pos:] == 9).sum())
+                        mi_right_samples -= max(0, tail - max_trial_samples)
 
                 # -----------------------------------------
                 # ESTIMATED DURATION PER TRIAL
                 # -----------------------------------------
-
-                sfreq = 300
 
                 left_sec_per_trial = (
                     mi_left_samples / mi_left_trials / sfreq
