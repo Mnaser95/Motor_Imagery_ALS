@@ -257,8 +257,8 @@ for subject_dir in subject_folders:
 
 summary = pd.DataFrame(summary_rows)
 
-output_dir = PROJECT_DIR / "outputs"
-output_dir.mkdir(exist_ok=True)
+output_dir = PROJECT_DIR / "outputs" / Path(__file__).stem
+output_dir.mkdir(parents=True, exist_ok=True)
 
 output_file = output_dir / "all_sessions_summary.csv"
 

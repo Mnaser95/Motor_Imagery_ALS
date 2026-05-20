@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import mne
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+import scipy.linalg
 from mne.decoding import CSP
 import matplotlib.pyplot as plt
 
@@ -37,7 +38,7 @@ MI_TMIN, MI_TMAX = 0, 4
 # CONFIGURATION — edit this section before running
 # =========================================================
 
-SUBJECTS  = ["Sub2_data"]   # list of subject folder names to process
+SUBJECTS  = ["Sub1_data"]   # list of subject folder names to process
 
 EXCLUDE_SESSIONS = {
     "Sub1_data": {5, 6, 12},
@@ -56,26 +57,35 @@ APPLY_ICA     = True
 ICA_THRESHOLD = 0.3
 
 # ---- Classifier selection ----
-# "csp_lda" : CSP + shrinkage LDA with Riemannian Alignment
-# "eegnet"  : EEGNet (PyTorch) with per-config z-scoring, no RA
-CLASSIFIER = "csp_lda"
+# "csp_lda"          : CSP + shrinkage LDA with Riemannian Alignment
+# "weighted_csp_lda" : impedance-weighted CSP + shrinkage LDA (no RA)
+# "eegnet"           : EEGNet (PyTorch) with Euclidean Alignment + z-scoring
+CLASSIFIER = "eegnet"
 
-# CSP hyperparameters (only used when CLASSIFIER == "csp_lda")
+# CSP hyperparameters (used when CLASSIFIER == "csp_lda" or "weighted_csp_lda")
 CSP_COMPONENTS = 4   # upper bound; auto-capped to (n_remaining_channels - 1)
+
+# Exponent for impedance quality score: q_i = (1/mean_Z_i)^k  (weighted_csp_lda only)
+QUALITY_EXPONENT = 1.1
 
 # EEGNet hyperparameters (only used when CLASSIFIER == "eegnet")
 EEGNET_F1       = 8
 EEGNET_D        = 2
 EEGNET_F2       = 16
 EEGNET_KERN_LEN = sfreq // 2   # 150 samples @ 300 Hz
-EEGNET_DROPOUT  = 0.5
-EEGNET_EPOCHS   = 300
+EEGNET_DROPOUT  = 0.25         # reduced from 0.5 — small datasets need less aggressive dropout
+EEGNET_EPOCHS   = 200
 EEGNET_BATCH    = 16
 EEGNET_LR       = 1e-3
-EEGNET_DEVICE       = "cuda"   # "auto" = cuda if available, else cpu; or force "cuda" / "cpu"
-EEGNET_USE_VAL      = False     # True  = split last EEGNET_VAL_SESSIONS sessions for validation
+EEGNET_WEIGHT_DECAY  = 1e-4    # L2 regularisation in Adam
+EEGNET_LR_PATIENCE   = 20      # ReduceLROnPlateau: halve LR after this many stagnant epochs
+EEGNET_NOISE_STD         = 0.05    # Gaussian noise augmentation std (0 = disabled)
+EEGNET_USE_IMPEDANCE     = True    # True = weight loss by per-epoch impedance quality scores
+EEGNET_SEED              = 42      # set to None to disable fixed seed
+EEGNET_DEVICE            = "cuda"  # "auto" = cuda if available, else cpu; or force "cuda" / "cpu"
+EEGNET_USE_VAL       = False   # True  = split last EEGNET_VAL_SESSIONS sessions for validation
                                 # False = all sessions used for training, no validation tracking
-EEGNET_VAL_SESSIONS = 2        # number of trailing sessions held out (only when EEGNET_USE_VAL=True)
+EEGNET_VAL_SESSIONS  = 2       # number of trailing sessions held out (only when EEGNET_USE_VAL=True)
 
 # Order of EEG channels in X (must match CH_MAP / MNE pick order)
 EEG_CH_NAMES = ["Cz", "CP2", "CP3", "FC2", "FC3"]
@@ -97,7 +107,7 @@ def load_session(file_path):
                 break
 
     if trigger_col is None:
-        return None, None
+        return None, None, None
 
     trigger = df[trigger_col].astype(int)
 
@@ -151,7 +161,7 @@ def load_session(file_path):
     ]
 
     if len(mi_events) == 0:
-        return None, None
+        return None, None, None
 
     picks = mne.pick_types(raw.info, eeg=True, eog=False, stim=False)
     epochs = mne.Epochs(
@@ -162,9 +172,10 @@ def load_session(file_path):
         preload=True, verbose=False,
     )
 
-    X = epochs.get_data()
-    y = (epochs.events[:, 2] == 9).astype(int)
-    return X, y
+    X         = epochs.get_data()
+    y         = (epochs.events[:, 2] == 9).astype(int)
+    onset_sec = epochs.events[:, 0] / sfreq
+    return X, y, onset_sec
 
 # =========================================================
 # RIEMANNIAN ALIGNMENT — per session (Zanini et al. 2018)
@@ -209,6 +220,82 @@ def riemannian_align(X):
     M_invsqrt = _mat_pow(M, -0.5)
     return np.stack([M_invsqrt @ x for x in X], axis=0)
 
+def euclidean_align(X):
+    """Whiten each session by arithmetic mean covariance M^{-1/2} (He & Wu 2020)."""
+    T    = X.shape[2]
+    covs = np.array([x @ x.T / T for x in X])
+    M    = covs.mean(axis=0)
+    M_invsqrt = _mat_pow(M, -0.5)
+    return np.stack([M_invsqrt @ x for x in X], axis=0)
+
+# =========================================================
+# WEIGHTED CSP
+# =========================================================
+
+class WeightedCSP:
+    """CSP with per-epoch impedance-quality-weighted class covariances."""
+
+    def __init__(self, n_components=4):
+        self.n_components = n_components
+        self.filters_     = None
+
+    def fit(self, X, y, sample_weight=None):
+        n_epochs, n_ch, n_times = X.shape
+        if sample_weight is None:
+            sample_weight = np.ones(n_epochs)
+
+        covs = []
+        for cls in [0, 1]:
+            idx = (y == cls)
+            w   = sample_weight[idx].copy()
+            w  /= w.sum()
+            C   = np.zeros((n_ch, n_ch))
+            for wi, xi in zip(w, X[idx]):
+                C += wi * (xi @ xi.T) / n_times
+            covs.append(C)
+
+        evals, evecs = scipy.linalg.eigh(covs[1], covs[0] + covs[1])
+        n_low  = self.n_components // 2
+        n_high = self.n_components - n_low
+        idx_s  = np.argsort(evals)
+        sel    = np.concatenate([idx_s[:n_low], idx_s[-n_high:]])
+        self.filters_ = evecs[:, sel]
+        return self
+
+    def transform(self, X):
+        return np.array([np.var(self.filters_.T @ x, axis=1) for x in X])
+
+    def fit_transform(self, X, y, sample_weight=None):
+        return self.fit(X, y, sample_weight).transform(X)
+
+
+def load_impedance_table(z_path):
+    if not z_path.exists():
+        return None
+    try:
+        df = pd.read_csv(z_path, comment="#", skipinitialspace=True)
+    except Exception:
+        return None
+    required = ["Time"] + EEG_CHANNELS
+    if any(c not in df.columns for c in required):
+        return None
+    df["Time"] = pd.to_numeric(df["Time"], errors="coerce")
+    for col in EEG_CHANNELS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[required].dropna(subset=["Time"]).reset_index(drop=True)
+
+
+def epoch_quality(z_table, onset_sec, active_ch_cols):
+    if z_table is None or not active_ch_cols:
+        return 1.0
+    idx   = (z_table["Time"] - onset_sec).abs().idxmin()
+    z_row = z_table.loc[idx, active_ch_cols].values.astype(float)
+    valid = z_row[np.isfinite(z_row) & (z_row > 0)]
+    if len(valid) == 0:
+        return 1.0
+    return float(np.mean(valid)) ** (-QUALITY_EXPONENT)
+
+
 # =========================================================
 # CSP + SHRINKAGE LDA
 # =========================================================
@@ -219,6 +306,18 @@ def train_csp_lda(X_tr, y_tr, X_te, y_te):
     lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
 
     X_tr_feat = np.nan_to_num(csp.fit_transform(X_tr, y_tr))
+    X_te_feat = np.nan_to_num(csp.transform(X_te))
+
+    lda.fit(X_tr_feat, y_tr)
+    return (lda.predict(X_te_feat) == y_te).mean() * 100
+
+
+def train_weighted_csp_lda(X_tr, y_tr, X_te, y_te, q_tr):
+    n_csp = min(CSP_COMPONENTS, X_tr.shape[1] - 1)
+    csp   = WeightedCSP(n_components=n_csp)
+    lda   = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+
+    X_tr_feat = np.nan_to_num(csp.fit_transform(X_tr, y_tr, sample_weight=q_tr))
     X_te_feat = np.nan_to_num(csp.transform(X_te))
 
     lda.fit(X_tr_feat, y_tr)
@@ -279,15 +378,27 @@ class _EEGNet(object):
         print(f"    [EEGNet] device: {self.device}")
         self.model  = _Model().to(self.device)
 
-    def fit(self, X, y, X_val=None, y_val=None):
+    def fit(self, X, y, q=None, X_val=None, y_val=None):
         import torch
         from torch.utils.data import TensorDataset, DataLoader
         Xt = torch.tensor(X[:, np.newaxis], dtype=torch.float32)
         yt = torch.tensor(y, dtype=torch.long)
-        loader  = DataLoader(TensorDataset(Xt, yt),
-                             batch_size=EEGNET_BATCH, shuffle=True)
-        opt     = torch.optim.Adam(self.model.parameters(), lr=EEGNET_LR)
-        loss_fn = self._nn.CrossEntropyLoss()
+        # Normalise quality weights so mean = 1 (preserves effective learning rate)
+        if q is not None:
+            qt = torch.tensor(q / q.mean(), dtype=torch.float32)
+        else:
+            qt = torch.ones(len(y), dtype=torch.float32)
+        g = torch.Generator()
+        if EEGNET_SEED is not None:
+            g.manual_seed(EEGNET_SEED)
+        loader  = DataLoader(TensorDataset(Xt, yt, qt),
+                             batch_size=EEGNET_BATCH, shuffle=True, generator=g)
+        opt      = torch.optim.Adam(self.model.parameters(),
+                                    lr=EEGNET_LR,
+                                    weight_decay=EEGNET_WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", factor=0.5, patience=EEGNET_LR_PATIENCE)
+        loss_fn = self._nn.CrossEntropyLoss(reduction="none")
 
         has_val = X_val is not None
         if has_val:
@@ -299,19 +410,23 @@ class _EEGNet(object):
         self.model.train()
         for _ in range(EEGNET_EPOCHS):
             epoch_loss = 0.0
-            for xb, yb in loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
+            for xb, yb, wb in loader:
+                xb, yb, wb = xb.to(self.device), yb.to(self.device), wb.to(self.device)
+                if EEGNET_NOISE_STD > 0:
+                    xb = xb + torch.randn_like(xb) * EEGNET_NOISE_STD
                 opt.zero_grad()
-                loss = loss_fn(self.model(xb), yb)
+                loss = (loss_fn(self.model(xb), yb) * wb).mean()
                 loss.backward()
                 opt.step()
                 epoch_loss += loss.item()
-            self.loss_history.append(epoch_loss / len(loader))
+            epoch_loss /= len(loader)
+            self.loss_history.append(epoch_loss)
+            scheduler.step(epoch_loss)
 
             if has_val:
                 self.model.eval()
                 with torch.no_grad():
-                    val_loss = loss_fn(self.model(Xv), yv).item()
+                    val_loss = loss_fn(self.model(Xv), yv).mean().item()
                 self.val_loss_history.append(val_loss)
                 self.model.train()
 
@@ -323,7 +438,16 @@ class _EEGNet(object):
             return self.model(Xt).argmax(dim=1).cpu().numpy()
 
 
-def train_eegnet(X_tr, y_tr, X_te, y_te, X_val=None, y_val=None):
+def train_eegnet(X_tr, y_tr, X_te, y_te, q_tr=None, X_val=None, y_val=None):
+    if EEGNET_SEED is not None:
+        import random, torch as _torch
+        random.seed(EEGNET_SEED)
+        np.random.seed(EEGNET_SEED)
+        _torch.manual_seed(EEGNET_SEED)
+        _torch.cuda.manual_seed_all(EEGNET_SEED)
+        _torch.backends.cudnn.deterministic = True
+        _torch.backends.cudnn.benchmark     = False
+
     mu    = X_tr.mean(axis=(0, 2), keepdims=True)
     sigma = X_tr.std(axis=(0, 2), keepdims=True)
     sigma = np.where(sigma < 1e-10, 1.0, sigma)
@@ -332,7 +456,7 @@ def train_eegnet(X_tr, y_tr, X_te, y_te, X_val=None, y_val=None):
     X_val_z = (X_val - mu) / sigma if X_val is not None else None
 
     net = _EEGNet(X_tr.shape[1], X_tr.shape[2])
-    net.fit(X_tr_z, y_tr, X_val=X_val_z, y_val=y_val)
+    net.fit(X_tr_z, y_tr, q=q_tr, X_val=X_val_z, y_val=y_val)
     preds = net.predict(X_te_z)
     return (preds == y_te).mean() * 100, net.loss_history, net.val_loss_history
 
@@ -347,6 +471,7 @@ for subject in SUBJECTS:
 
     subject_dir  = PROJECT_DIR / subject
     filtered_dir = subject_dir / "Filtered_data"
+    z_dir        = subject_dir / "Z"
     session_files = sorted(
         filtered_dir.glob("*.csv"),
         key=lambda f: int(m.group(1)) if (m := re.search(r"Ses(\d+)", f.stem, re.IGNORECASE)) else 0
@@ -380,12 +505,12 @@ for subject in SUBJECTS:
 
         print(f"\n  Session: {ses_name}", flush=True)
 
-        X, y = load_session(f)
+        X, y, onset_sec = load_session(f)
         if X is None:
             print("    skipped (no MI epochs)")
             continue
 
-        rej_file = (PROJECT_DIR / "outputs" / "epoch_rejection"
+        rej_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review" / "epoch_rejection"
                     / subject / f"{ses_name}_bad_epochs.json")
         bad_ch: list[str] = []
         if rej_file.exists():
@@ -393,9 +518,12 @@ for subject in SUBJECTS:
                 bad = json.load(fh)
             good_mask = np.ones(len(X), dtype=bool)
             good_mask[bad["bad_indices"]] = False
-            X, y = X[good_mask], y[good_mask]
+            X, y, onset_sec = X[good_mask], y[good_mask], onset_sec[good_mask]
             print(f"    Rejection file loaded: {bad['n_bad']} epochs dropped")
             bad_ch = [ch for ch in bad.get("bad_channels", []) if ch in EEG_CH_NAMES]
+
+        active_eeg_cols = [c for c, name in zip(EEG_CHANNELS, EEG_CH_NAMES)
+                           if name not in bad_ch]
 
         if bad_ch:
             if len(bad_ch) >= len(EEG_CH_NAMES):
@@ -405,13 +533,33 @@ for subject in SUBJECTS:
             X[:, ch_idx, :] = 0.0
             print(f"    Bad channels zeroed: {bad_ch}")
 
+        # --- Impedance quality scores (weighted_csp_lda and eegnet) ---
+        if CLASSIFIER in ("weighted_csp_lda", "eegnet"):
+            ses_match = re.search(r"Ses(\d+)", ses_name, re.IGNORECASE)
+            z_table   = None
+            if ses_match:
+                z_path  = z_dir / f"{int(ses_match.group(1))}.csv"
+                z_table = load_impedance_table(z_path)
+            if z_table is not None:
+                q = np.array([epoch_quality(z_table, t, active_eeg_cols)
+                               for t in onset_sec])
+                print(f"    Impedance quality: min={q.min():.3f}  max={q.max():.3f}")
+            else:
+                q = np.ones(len(X))
+                print("    Impedance file not found — uniform quality scores")
+        else:
+            q = np.ones(len(X))
+
         if CLASSIFIER == "csp_lda":
             X = riemannian_align(X)
             print(f"    {len(X)} epochs (RA)  (L={int((y==0).sum())}  R={int((y==1).sum())})")
+        elif CLASSIFIER == "eegnet":
+            X = euclidean_align(X)
+            print(f"    {len(X)} epochs (EA)  (L={int((y==0).sum())}  R={int((y==1).sum())})")
         else:
             print(f"    {len(X)} epochs       (L={int((y==0).sum())}  R={int((y==1).sum())})")
 
-        sessions_data.append((ses_name, X, y))
+        sessions_data.append((ses_name, X, y, q))
         n_sessions_used += 1
 
     if len(sessions_data) == 0:
@@ -420,7 +568,7 @@ for subject in SUBJECTS:
 
     all_results.append((subject, sessions_data))
 
-out_dir = PROJECT_DIR / "outputs" / "results"
+out_dir = PROJECT_DIR / "outputs" / Path(__file__).stem / CLASSIFIER
 out_dir.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
@@ -458,7 +606,7 @@ for subject, sessions_data in all_results:
         print(f"  {subject:<20}  session {test_ses} not found — skipping")
         continue
 
-    te_name, X_te, y_te = ses_lookup[test_ses]
+    te_name, X_te, y_te, q_te = ses_lookup[test_ses]
 
     # Build shrinking configs: start from first available session,
     # drop one from the front each iteration; keep at least 2 training sessions
@@ -473,18 +621,25 @@ for subject, sessions_data in all_results:
         if use_val:
             fit_cfg = config[:-EEGNET_VAL_SESSIONS]
             val_cfg = config[-EEGNET_VAL_SESSIONS:]
-            X_tr = np.concatenate([ses_lookup[s][1] for s in fit_cfg], axis=0)
-            y_tr = np.concatenate([ses_lookup[s][2] for s in fit_cfg], axis=0)
+            X_tr  = np.concatenate([ses_lookup[s][1] for s in fit_cfg], axis=0)
+            y_tr  = np.concatenate([ses_lookup[s][2] for s in fit_cfg], axis=0)
             X_val = np.concatenate([ses_lookup[s][1] for s in val_cfg], axis=0)
             y_val = np.concatenate([ses_lookup[s][2] for s in val_cfg], axis=0)
+            q_tr  = np.concatenate([ses_lookup[s][3] for s in fit_cfg], axis=0)
         else:
-            X_tr = np.concatenate([ses_lookup[s][1] for s in config], axis=0)
-            y_tr = np.concatenate([ses_lookup[s][2] for s in config], axis=0)
+            X_tr  = np.concatenate([ses_lookup[s][1] for s in config], axis=0)
+            y_tr  = np.concatenate([ses_lookup[s][2] for s in config], axis=0)
+            q_tr  = np.concatenate([ses_lookup[s][3] for s in config], axis=0)
             X_val = y_val = None
 
         if CLASSIFIER == "eegnet":
             acc, loss_hist, val_loss_hist = train_eegnet(
-                X_tr, y_tr, X_te, y_te, X_val=X_val, y_val=y_val)
+                X_tr, y_tr, X_te, y_te,
+                q_tr=q_tr if EEGNET_USE_IMPEDANCE else None,
+                X_val=X_val, y_val=y_val)
+        elif CLASSIFIER == "weighted_csp_lda":
+            acc, loss_hist, val_loss_hist = train_weighted_csp_lda(
+                X_tr, y_tr, X_te, y_te, q_tr), None, None
         else:
             acc, loss_hist, val_loss_hist = train_csp_lda(X_tr, y_tr, X_te, y_te), None, None
         label = f"{config[0]}-{config[-1]}"
@@ -505,12 +660,12 @@ with open(out_csv_fixed, "w", newline="") as fh:
                          test_ses, CLASSIFIER, f"{acc:.2f}"])
 print(f"\nFixed-test results saved to:\n  {out_csv_fixed}")
 
-# CSP plots — one per training configuration (csp_lda only)
-if CLASSIFIER != "csp_lda":
+# CSP plots — one per training configuration (csp_lda and weighted_csp_lda only)
+if CLASSIFIER == "eegnet":
     print("\nCSP visualization skipped (not applicable for EEGNet).")
 
 for subject, test_ses, label, config, acc, X_tr, y_tr, X_te, y_te, te_name, ses_lookup, *_ \
-        in (fixed_results if CLASSIFIER == "csp_lda" else []):
+        in (fixed_results if CLASSIFIER in ("csp_lda", "weighted_csp_lda") else []):
 
     fig, ax = plt.subplots(figsize=(7, 6))
 
@@ -521,7 +676,7 @@ for subject, test_ses, label, config, acc, X_tr, y_tr, X_te, y_te, te_name, ses_
 
     # Training sessions
     for k, s in enumerate(config):
-        sname, Xs, ys = ses_lookup[s]
+        sname, Xs, ys, _ = ses_lookup[s]
         feats = np.nan_to_num(csp.transform(Xs))
         for cls in [0, 1]:
             mask = ys == cls
@@ -564,16 +719,18 @@ for subject, test_ses, label, config, acc, X_tr, y_tr, X_te, y_te, te_name, ses_
     ax.set_xlabel("CSP Component 1 (log-var)", fontsize=10)
     ax.set_ylabel("CSP Component 2 (log-var)", fontsize=10)
     ax.legend(fontsize=8, loc="upper right", framealpha=0.8)
+    method_label = ("Riemannian Aligned" if CLASSIFIER == "csp_lda"
+                    else "Impedance-Weighted")
     fig.suptitle(
         f"{subject}  |  Train: {label}  →  Test: Session {test_ses}\n"
-        f"CSP+LDA accuracy: {acc:.1f}%  |  Riemannian Aligned",
+        f"CSP+LDA accuracy: {acc:.1f}%  |  {method_label}",
         fontsize=11, fontweight="bold"
     )
     fig.tight_layout()
 
     csp_path = out_dir / f"{subject}_csp_fixed_test{test_ses}_train{label}.png"
     fig.savefig(csp_path, dpi=150, bbox_inches="tight")
-    plt.show()
+    plt.close(fig)
     print(f"  CSP plot saved: {csp_path}")
 
 # =========================================================
@@ -630,6 +787,6 @@ if CLASSIFIER == "eegnet":
 
         curves_path = out_dir / f"{subject}_eegnet_training_curves.png"
         fig.savefig(curves_path, dpi=150, bbox_inches="tight")
-        plt.show()
+        plt.close(fig)
         print(f"Training curves saved: {curves_path}")
 

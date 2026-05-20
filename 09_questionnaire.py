@@ -8,9 +8,8 @@ For each session:
   4. Load the matching pre-session questionnaire (Q/<session_num>.csv).
   5. Encode choice-type answers ordinally.
 
-Outputs (in outputs/results/):
+Outputs (in outputs/09_questionnaire/):
   - questionnaire_resting_eeg.csv       : one row per session
-  - resting_eeg_correlations_pearson.csv
   - resting_eeg_correlations_spearman.csv
   - questionnaire_resting_eeg_heatmap.png
 """
@@ -523,7 +522,7 @@ def parse_questionnaire(q_file: Path) -> dict[str, float]:
 # =========================================================
 
 # Load per-session CSP+LDA accuracy produced by 06b
-_acc_csv = PROJECT_DIR / "outputs" / "results" / "standard_csp_results_per_session.csv"
+_acc_csv = PROJECT_DIR / "outputs" / "06_classify_sinlge_session" / "standard_csp_results_per_session.csv"
 _acc_lookup: dict[tuple, float] = {}
 if _acc_csv.exists():
     _df_acc = pd.read_csv(_acc_csv)
@@ -600,7 +599,7 @@ if not records:
 
 df_all = pd.DataFrame(records)
 
-out_dir = PROJECT_DIR / "outputs" / "results"
+out_dir = PROJECT_DIR / "outputs" / Path(__file__).stem
 out_dir.mkdir(parents=True, exist_ok=True)
 
 # Build (column_name, display_label) pairs; filter to cols present in df_all.
@@ -709,8 +708,6 @@ for subject in SUBJECTS:
 
     df_num = df_sub[q_cols + eeg_summary_cols].apply(pd.to_numeric, errors="coerce")
 
-    pearson_r  = np.full((nq, ne), np.nan)
-    pearson_p  = np.full((nq, ne), np.nan)
     spearman_r = np.full((nq, ne), np.nan)
     spearman_p = np.full((nq, ne), np.nan)
 
@@ -721,26 +718,20 @@ for subject in SUBJECTS:
             valid = df_num[[q, e]].dropna()
             if len(valid) < 5:
                 continue
-            pr, pp = stats.pearsonr(valid[q], valid[e])
             sr, sp = stats.spearmanr(valid[q], valid[e])
-            pearson_r[qi, ei]  = pr;  pearson_p[qi, ei]  = pp
             spearman_r[qi, ei] = sr;  spearman_p[qi, ei] = sp
 
     fig_h = max(5, nq * 0.55 + 2.5)
-    fig_w = max(14, ne * 1.5 + 3)
+    fig_w = max(8, ne * 1.0 + 3)
     fig   = plt.figure(figsize=(fig_w, fig_h))
-    gs    = fig.add_gridspec(1, 3, width_ratios=[ne, ne, 0.6],
-                             wspace=0.35, left=0.14, right=0.93,
+    gs    = fig.add_gridspec(1, 2, width_ratios=[ne, 0.6],
+                             wspace=0.08, left=0.18, right=0.93,
                              top=0.88, bottom=0.22)
     ax1     = fig.add_subplot(gs[0])
-    ax2     = fig.add_subplot(gs[1])
-    cbar_ax = fig.add_subplot(gs[2])
+    cbar_ax = fig.add_subplot(gs[1])
 
-    draw_heatmap(ax1, pearson_r,  pearson_p,  ne, nq, q_cols, "Pearson r",
-                 blocked_row_indices=blocked_row_indices)
-    draw_heatmap(ax2, spearman_r, spearman_p, ne, nq, q_cols, "Spearman ρ",
+    draw_heatmap(ax1, spearman_r, spearman_p, ne, nq, q_cols, "Spearman ρ",
                  blocked_row_indices=blocked_row_indices, cbar_ax=cbar_ax)
-    ax2.set_yticks([])
 
     n_ses = len(df_sub)
     fig.suptitle(

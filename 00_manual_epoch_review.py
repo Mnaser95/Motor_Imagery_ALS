@@ -152,7 +152,7 @@ session_files = sorted(filtered_dir.glob("*.csv"))
 if len(session_files) == 0:
     raise RuntimeError(f"No filtered CSV files found in {filtered_dir}")
 
-out_dir = PROJECT_DIR / "outputs" / "epoch_rejection" / SUBJECT
+out_dir = PROJECT_DIR / "outputs" / Path(__file__).stem / "epoch_rejection" / SUBJECT
 out_dir.mkdir(parents=True, exist_ok=True)
 
 print(f"Subject : {SUBJECT}  —  {len(session_files)} sessions\n")

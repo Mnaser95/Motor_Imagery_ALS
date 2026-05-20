@@ -7,9 +7,11 @@ import pandas as pd
 import scipy.linalg
 import matplotlib.pyplot as plt
 import mne
+from mne.decoding import CSP
 from sklearn.model_selection import train_test_split
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 import csv
+from collections import defaultdict
 
 PROJECT_DIR = Path(__file__).resolve().parent
 sfreq       = 300
@@ -38,7 +40,8 @@ MI_TMIN, MI_TMAX = 0, 4
 # CONFIGURATION — edit this section before running
 # =========================================================
 
-SUBJECTS  = ["Sub1_data"]
+SUBJECT  = "Sub3_data"   # ← change this before running
+SUBJECTS = [SUBJECT]
 
 N_SPLITS    = 5
 TRAIN_RATIO = 0.75
@@ -59,7 +62,11 @@ EEG_CH_NAMES = ["Cz", "CP2", "CP3", "FC2", "FC3"]
 QUALITY_EXPONENT = 3
 
 # Sessions shown in black and excluded from group mean calculations.
-MARKED_SESSIONS = {5, 6, 12}
+MARKED_SESSIONS = {
+    "Sub1_data": {5, 6, 12},
+    "Sub2_data": {8},
+    "Sub3_data": {14, 15, 19},
+}
 
 # =========================================================
 # WEIGHTED CSP
@@ -246,7 +253,7 @@ def load_session(file_path):
 # CLASSIFIERS
 # =========================================================
 
-def train_csp_lda(X_tr, y_tr, X_te, y_te, q_tr):
+def train_weighted_csp_lda(X_tr, y_tr, X_te, y_te, q_tr):
     n_csp = min(CSP_COMPONENTS, X_tr.shape[1] - 1)
     csp   = WeightedCSP(n_components=n_csp)
     lda   = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
@@ -258,18 +265,31 @@ def train_csp_lda(X_tr, y_tr, X_te, y_te, q_tr):
     return (lda.predict(X_te_feat) == y_te).mean() * 100
 
 
+def train_standard_csp_lda(X_tr, y_tr, X_te, y_te):
+    n_csp = min(CSP_COMPONENTS, X_tr.shape[1] - 1)
+    csp   = CSP(n_components=n_csp, reg=None, log=False, norm_trace=False)
+    lda   = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+
+    X_tr_feat = np.nan_to_num(csp.fit_transform(X_tr, y_tr))
+    X_te_feat = np.nan_to_num(csp.transform(X_te))
+
+    lda.fit(X_tr_feat, y_tr)
+    return (lda.predict(X_te_feat) == y_te).mean() * 100
+
 
 # =========================================================
 # MAIN
 # =========================================================
 
-all_results = []
+all_results_weighted = []
+all_results_standard = []
 
 for subject in SUBJECTS:
 
     subject_dir  = PROJECT_DIR / subject
     filtered_dir = subject_dir / "Filtered_data"
     z_dir        = subject_dir / "Z"
+    marked       = MARKED_SESSIONS.get(subject, set())
 
     session_files = sorted(
         filtered_dir.glob("*.csv"),
@@ -294,7 +314,7 @@ for subject in SUBJECTS:
             continue
 
         # --- Epoch rejection ---
-        rejection_file = (PROJECT_DIR / "outputs" / "epoch_rejection"
+        rejection_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review" / "epoch_rejection"
                           / subject / f"{ses_name}_bad_epochs.json")
         bad_ch = []
         if rejection_file.exists():
@@ -344,7 +364,8 @@ for subject in SUBJECTS:
         n_trials = len(X)
         print(f"    {n_trials} epochs  (L={int((y==0).sum())}  R={int((y==1).sum())})")
 
-        lda_accs = []
+        weighted_accs = []
+        standard_accs = []
 
         for split_idx in range(N_SPLITS):
             seed = split_idx * 17 + 3
@@ -357,179 +378,192 @@ for subject in SUBJECTS:
             X_tr, y_tr, q_tr = X[idx_tr], y[idx_tr], q[idx_tr]
             X_te, y_te        = X[idx_te], y[idx_te]
 
-            lda_accs.append(train_csp_lda(X_tr, y_tr, X_te, y_te, q_tr))
+            weighted_accs.append(train_weighted_csp_lda(X_tr, y_tr, X_te, y_te, q_tr))
+            standard_accs.append(train_standard_csp_lda(X_tr, y_tr, X_te, y_te))
 
-        all_results.append((subject, ses_name, lda_accs))
+        all_results_weighted.append((subject, ses_name, weighted_accs))
+        all_results_standard.append((subject, ses_name, standard_accs))
+
 
 # =========================================================
-# BOX-WHISKER PLOT
+# PLOT + CSV HELPER
 # =========================================================
 
-from collections import defaultdict
-subject_sessions: dict = defaultdict(list)
-for subject, ses_name, lda_accs in all_results:
-    subject_sessions[subject].append((ses_name, lda_accs))
+def plot_and_save(all_results, title_suffix, fig_filename, csv_filename, csv_detail_filename):
 
-COLOR_LDA = "#2196F3"
-COLOR_AVG = "#E65100"
+    subject_sessions: dict = defaultdict(list)
+    for subject, ses_name, accs in all_results:
+        subject_sessions[subject].append((ses_name, accs))
 
-n_subj = len(subject_sessions)
-fig, axes = plt.subplots(
-    n_subj, 1,
-    figsize=(max(10, len(all_results) * 1.4), 5 * n_subj),
-    squeeze=False,
+    COLOR_LDA = "#2196F3"
+    COLOR_AVG = "#E65100"
+
+    n_subj = len(subject_sessions)
+    fig, axes = plt.subplots(
+        n_subj, 1,
+        figsize=(max(10, len(all_results) * 1.4), 5 * n_subj),
+        squeeze=False,
+    )
+
+    group_rows = []
+
+    for ax_idx, (subject, sessions) in enumerate(subject_sessions.items()):
+        ax     = axes[ax_idx][0]
+        marked = MARKED_SESSIONS.get(subject, set())
+
+        if subject in N_GROUPS_SUBJECT:
+            grp = math.ceil(len(sessions) / N_GROUPS_SUBJECT[subject])
+        else:
+            grp = GROUP_SIZE_SUBJECT.get(subject, GROUP_SIZE)
+
+        n        = len(sessions)
+        lda_data = [s[1] for s in sessions]
+        centers  = np.arange(n, dtype=float)
+
+        ses_nums = []
+        for sn, _ in sessions:
+            m = re.search(r"Ses(\d+)", sn, re.IGNORECASE)
+            ses_nums.append(int(m.group(1)) if m else sn)
+
+        for i, (data_i, num) in enumerate(zip(lda_data, ses_nums)):
+            color = "black" if num in marked else COLOR_LDA
+            ax.boxplot(
+                [data_i], positions=[centers[i]], widths=0.6,
+                patch_artist=True,
+                medianprops=dict(color="yellow", linewidth=2),
+                boxprops=dict(facecolor=color, alpha=0.85),
+                whiskerprops=dict(color=color, linewidth=1.2),
+                capprops=dict(color=color, linewidth=1.2),
+                flierprops=dict(marker="o", markerfacecolor=color,
+                                markersize=4, alpha=0.5, linestyle="none"),
+            )
+
+        ax.axhline(50, color="gray", linestyle="--", linewidth=1, alpha=0.6)
+
+        grp_x        = []
+        grp_mean_all = []
+        grp_mean_act = []
+
+        for g_idx, start in enumerate(range(0, n, grp)):
+            end = min(start + grp, n)
+
+            if start > 0:
+                ax.axvline(centers[start] - 0.5, color="black",
+                           linestyle=":", linewidth=1, alpha=0.4)
+
+            grp_x.append(float(np.mean(centers[start:end])))
+
+            all_means = [float(np.mean(lda_data[i])) for i in range(start, end)]
+            grp_mean_all.append(float(np.mean(all_means)))
+
+            active_means = [
+                float(np.mean(lda_data[i]))
+                for i in range(start, end)
+                if ses_nums[i] not in marked
+            ]
+            grp_mean_act.append(
+                float(np.mean(active_means)) if active_means else float(np.mean(all_means))
+            )
+
+            group = sessions[start:end]
+            lda_means_csv = [
+                float(np.mean(la)) for sn, la in group
+                if (m := re.search(r"Ses(\d+)", sn, re.IGNORECASE))
+                and int(m.group(1)) not in marked
+            ]
+            if lda_means_csv:
+                group_rows.append((
+                    subject, f"Group {g_idx + 1}", sessions[start][0], sessions[end - 1][0],
+                    float(np.mean(lda_means_csv)), float(np.std(lda_means_csv)),
+                ))
+
+        ax.plot(grp_x, grp_mean_all, "o-",  color=COLOR_AVG,  linewidth=2,
+                markersize=7, zorder=6, label="Group mean (all)")
+        ax.plot(grp_x, grp_mean_act, "s--", color="#4CAF50",   linewidth=2,
+                markersize=7, zorder=6, label="Group mean (excl. marked)")
+
+        for x, va, ve in zip(grp_x, grp_mean_all, grp_mean_act):
+            ax.text(x, va + 1.2, f"{va:.1f}%", ha="center", fontsize=7,
+                    color=COLOR_AVG, fontweight="bold")
+            ax.text(x, ve - 2.5, f"{ve:.1f}%", ha="center", fontsize=7,
+                    color="#4CAF50", fontweight="bold")
+
+        ax.set_xticks(centers)
+        ax.set_xticklabels([str(s) for s in ses_nums], fontsize=9)
+        ax.set_xlim(centers[0] - 0.5, centers[-1] + 0.5)
+        ax.set_ylim(0, 110)
+        ax.set_xlabel("Session", fontsize=10)
+        ax.set_ylabel("Accuracy (%)", fontsize=10)
+        ax.set_title(
+            f"{subject}  —  {title_suffix}",
+            fontsize=11, fontweight="bold",
+        )
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(
+            handles=[
+                plt.Line2D([0], [0], color="gray", linestyle="--",
+                           linewidth=1, label="Chance (50%)"),
+                plt.Line2D([0], [0], color=COLOR_AVG, marker="o",
+                           linewidth=2, label="Group mean (all)"),
+                plt.Line2D([0], [0], color="#4CAF50", marker="s",
+                           linestyle="--", linewidth=2, label="Group mean (excl. marked)"),
+            ],
+            fontsize=9, loc="upper right",
+        )
+
+    fig.tight_layout()
+
+    out_dir = PROJECT_DIR / "outputs" / Path(__file__).stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_fig = out_dir / fig_filename
+    fig.savefig(out_fig, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"Figure saved to:\n  {out_fig}")
+
+    out_csv = out_dir / csv_filename
+    with open(out_csv, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["subject", "group", "first_session", "last_session",
+                         "lda_mean_%", "lda_std_%"])
+        for row in group_rows:
+            subj, lbl, first, last, lm, ls = row
+            writer.writerow([subj, lbl, first, last, f"{lm:.2f}", f"{ls:.2f}"])
+
+    out_csv_detail = out_dir / csv_detail_filename
+    with open(out_csv_detail, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        split_headers = [f"split_{i+1}_%" for i in range(N_SPLITS)]
+        writer.writerow(
+            ["subject", "session", "lda_mean_%", "lda_std_%"]
+            + [f"lda_{h}" for h in split_headers]
+        )
+        for subject, ses_name, accs in all_results:
+            writer.writerow(
+                [subject, ses_name,
+                 f"{np.mean(accs):.2f}", f"{np.std(accs):.2f}"]
+                + [f"{a:.2f}" for a in accs]
+            )
+
+    print(f"\nResults saved to:\n  {out_csv}\n  {out_csv_detail}")
+
+
+# =========================================================
+# PLOT AND SAVE BOTH METHODS
+# =========================================================
+
+plot_and_save(
+    all_results_weighted,
+    title_suffix=f"impedance-weighted CSP+LDA  ({N_SPLITS} splits, exponent={QUALITY_EXPONENT})",
+    fig_filename=f"{SUBJECT}_impedance_weighted_boxplot.png",
+    csv_filename=f"{SUBJECT}_impedance_weighted_results.csv",
+    csv_detail_filename=f"{SUBJECT}_impedance_weighted_results_per_session.csv",
 )
 
-group_rows = []
-
-for ax_idx, (subject, sessions) in enumerate(subject_sessions.items()):
-    ax = axes[ax_idx][0]
-
-    if subject in N_GROUPS_SUBJECT:
-        grp = math.ceil(len(sessions) / N_GROUPS_SUBJECT[subject])
-    else:
-        grp = GROUP_SIZE_SUBJECT.get(subject, GROUP_SIZE)
-
-    n        = len(sessions)
-    lda_data = [s[1] for s in sessions]
-    centers  = np.arange(n, dtype=float)
-
-    # Extract integer session numbers for tick labels
-    ses_nums = []
-    for sn, _ in sessions:
-        m = re.search(r"Ses(\d+)", sn, re.IGNORECASE)
-        ses_nums.append(int(m.group(1)) if m else sn)
-
-    # Plot each session individually to allow per-box colour control
-    for i, (data_i, num) in enumerate(zip(lda_data, ses_nums)):
-        color = "black" if num in MARKED_SESSIONS else COLOR_LDA
-        ax.boxplot(
-            [data_i], positions=[centers[i]], widths=0.6,
-            patch_artist=True,
-            medianprops=dict(color="yellow", linewidth=2),
-            boxprops=dict(facecolor=color, alpha=0.85),
-            whiskerprops=dict(color=color, linewidth=1.2),
-            capprops=dict(color=color, linewidth=1.2),
-            flierprops=dict(marker="o", markerfacecolor=color,
-                            markersize=4, alpha=0.5, linestyle="none"),
-        )
-
-    # Chance line
-    ax.axhline(50, color="gray", linestyle="--", linewidth=1, alpha=0.6)
-
-    # Group dividers + collect both means per group
-    grp_x        = []   # x position (centre of group)
-    grp_mean_all = []   # mean including marked sessions
-    grp_mean_act = []   # mean excluding marked sessions
-
-    for g_idx, start in enumerate(range(0, n, grp)):
-        end = min(start + grp, n)
-
-        if start > 0:
-            ax.axvline(centers[start] - 0.5, color="black",
-                       linestyle=":", linewidth=1, alpha=0.4)
-
-        grp_x.append(float(np.mean(centers[start:end])))
-
-        all_means = [float(np.mean(lda_data[i])) for i in range(start, end)]
-        grp_mean_all.append(float(np.mean(all_means)))
-
-        active_means = [
-            float(np.mean(lda_data[i]))
-            for i in range(start, end)
-            if ses_nums[i] not in MARKED_SESSIONS
-        ]
-        grp_mean_act.append(float(np.mean(active_means)) if active_means else float(np.mean(all_means)))
-
-        # CSV row uses active mean
-        group = sessions[start:end]
-        lda_means_csv = [
-            float(np.mean(la)) for sn, la in group
-            if (m := re.search(r"Ses(\d+)", sn, re.IGNORECASE))
-            and int(m.group(1)) not in MARKED_SESSIONS
-        ]
-        if lda_means_csv:
-            group_rows.append((
-                subject, f"Group {g_idx + 1}", sessions[start][0], sessions[end - 1][0],
-                float(np.mean(lda_means_csv)), float(np.std(lda_means_csv)),
-            ))
-
-    # Connected line plots for both means across groups
-    ax.plot(grp_x, grp_mean_all, "o-",  color=COLOR_AVG,  linewidth=2,
-            markersize=7, zorder=6, label="Group mean (all)")
-    ax.plot(grp_x, grp_mean_act, "s--", color="#4CAF50",   linewidth=2,
-            markersize=7, zorder=6, label="Group mean (excl. marked)")
-
-    # Annotate values next to each point
-    right_edge = centers[-1] + 0.5
-    for x, va, ve in zip(grp_x, grp_mean_all, grp_mean_act):
-        ax.text(x, va + 1.2, f"{va:.1f}%", ha="center", fontsize=7,
-                color=COLOR_AVG, fontweight="bold")
-        ax.text(x, ve - 2.5, f"{ve:.1f}%", ha="center", fontsize=7,
-                color="#4CAF50", fontweight="bold")
-
-    ax.set_xticks(centers)
-    ax.set_xticklabels([str(s) for s in ses_nums], fontsize=9)
-    ax.set_xlim(centers[0] - 0.5, right_edge)
-    ax.set_ylim(0, 110)
-    ax.set_xlabel("Session", fontsize=10)
-    ax.set_ylabel("Accuracy (%)", fontsize=10)
-    ax.set_title(
-        f"{subject}  —  impedance-weighted CSP+LDA  "
-        f"({N_SPLITS} splits, exponent={QUALITY_EXPONENT})",
-        fontsize=11, fontweight="bold",
-    )
-    ax.grid(axis="y", alpha=0.3)
-    ax.legend(
-        handles=[
-            plt.Line2D([0], [0], color="gray", linestyle="--",
-                       linewidth=1, label="Chance (50%)"),
-            plt.Line2D([0], [0], color=COLOR_AVG, marker="o",
-                       linewidth=2, label="Group mean (all)"),
-            plt.Line2D([0], [0], color="#4CAF50", marker="s",
-                       linestyle="--", linewidth=2, label="Group mean (excl. marked)"),
-        ],
-        fontsize=9, loc="upper right",
-    )
-
-fig.tight_layout()
-
-out_dir = PROJECT_DIR / "outputs" / "results"
-out_dir.mkdir(parents=True, exist_ok=True)
-out_fig = out_dir / "impedance_weighted_boxplot.png"
-fig.savefig(out_fig, dpi=150, bbox_inches="tight")
-plt.show()
-print(f"Figure saved to:\n  {out_fig}")
-
-# =========================================================
-# SAVE CSV
-# =========================================================
-
-out_dir = PROJECT_DIR / "outputs" / "results"
-out_dir.mkdir(parents=True, exist_ok=True)
-
-out_csv = out_dir / "impedance_weighted_results.csv"
-with open(out_csv, "w", newline="") as fh:
-    writer = csv.writer(fh)
-    writer.writerow(["subject", "group", "first_session", "last_session",
-                     "lda_mean_%", "lda_std_%"])
-    for row in group_rows:
-        subj, lbl, first, last, lm, ls = row
-        writer.writerow([subj, lbl, first, last, f"{lm:.2f}", f"{ls:.2f}"])
-
-out_csv_detail = out_dir / "impedance_weighted_results_per_session.csv"
-with open(out_csv_detail, "w", newline="") as fh:
-    writer = csv.writer(fh)
-    split_headers = [f"split_{i+1}_%" for i in range(N_SPLITS)]
-    writer.writerow(
-        ["subject", "session", "lda_mean_%", "lda_std_%"]
-        + [f"lda_{h}" for h in split_headers]
-    )
-    for subject, ses_name, lda_accs in all_results:
-        writer.writerow(
-            [subject, ses_name,
-             f"{np.mean(lda_accs):.2f}", f"{np.std(lda_accs):.2f}"]
-            + [f"{a:.2f}" for a in lda_accs]
-        )
-
-print(f"\nResults saved to:\n  {out_csv}\n  {out_csv_detail}")
+plot_and_save(
+    all_results_standard,
+    title_suffix=f"standard CSP+LDA  ({N_SPLITS} splits)",
+    fig_filename=f"{SUBJECT}_standard_csp_boxplot.png",
+    csv_filename=f"{SUBJECT}_standard_csp_results.csv",
+    csv_detail_filename=f"{SUBJECT}_standard_csp_results_per_session.csv",
+)
