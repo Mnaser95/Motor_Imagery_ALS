@@ -1,0 +1,22 @@
+{
+  "subject": "Sub3_data",
+  "session": "Sub003_Ses019",
+  "total_epochs": 40,
+  "bad_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    10,
+    19,
+    24,
+    25,
+    31,
+    37
+  ],
+  "n_bad": 13,
+  "bad_channels": []
+}

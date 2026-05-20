@@ -5,6 +5,13 @@ EEG_Study/
 # Generated outputs
 outputs/
 figures/
+
+# Exception: epoch rejection JSONs must be version-controlled
+!outputs/epoch_rejection/
+!outputs/epoch_rejection/**
+!outputs/00_manual_epoch_review/
+!outputs/00_manual_epoch_review/epoch_rejection/
+!outputs/00_manual_epoch_review/epoch_rejection/**
 *.png
 *.jpg
 *.jpeg

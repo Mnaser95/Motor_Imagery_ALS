@@ -1,0 +1,11 @@
+{
+  "subject": "Sub1_data",
+  "session": "Sub001Ses020",
+  "total_epochs": 40,
+  "bad_indices": [
+    7,
+    38
+  ],
+  "n_bad": 2,
+  "bad_channels": []
+}
