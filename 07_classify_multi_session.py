@@ -41,11 +41,11 @@ MI_TMIN, MI_TMAX = 0, 4
 SUBJECTS  = ["Sub1_data"]   # list of subject folder names to process
 
 EXCLUDE_SESSIONS = {
-    "Sub1_data": {5, 6, 12},
+    "Sub1_data": {},
     "Sub2_data": {8},
     "Sub3_data": {14, 15, 19},   # matches MARKED_SESSIONS in 06b
 }
-EXCLUDE_SESSIONS_DEFAULT = {5, 6, 12}
+EXCLUDE_SESSIONS_DEFAULT = {}
 
 # Plot colours / markers
 TRAIN_COLORS  = ["#E53935", "#1565C0", "#F9A825", "#AB47BC", "#FF7043"]   # red, blue, yellow, purple, orange
@@ -53,14 +53,12 @@ TEST_COLOR    = "black"
 CLASS_MARKERS = {0: "o", 1: "^"}   # circle = MI Left, triangle = MI Right
 CLASS_LABELS  = {0: "MI Left", 1: "MI Right"}
 
-APPLY_ICA     = True
-ICA_THRESHOLD = 0.3
 
 # ---- Classifier selection ----
 # "csp_lda"          : CSP + shrinkage LDA with Riemannian Alignment
 # "weighted_csp_lda" : impedance-weighted CSP + shrinkage LDA (no RA)
 # "eegnet"           : EEGNet (PyTorch) with Euclidean Alignment + z-scoring
-CLASSIFIER = "eegnet"
+CLASSIFIER = "csp_lda"
 
 # CSP hyperparameters (used when CLASSIFIER == "csp_lda" or "weighted_csp_lda")
 CSP_COMPONENTS = 4   # upper bound; auto-capped to (n_remaining_channels - 1)
@@ -129,27 +127,9 @@ def load_session(file_path):
     raw.set_montage(montage, on_missing="ignore")
 
     raw.filter(l_freq=6.0, h_freq=50.0, method="fir",
-               fir_window="hamming", verbose=False)
-
-    if APPLY_ICA:
-        ica = mne.preprocessing.ICA(
-            n_components=len(EEG_CHANNELS), random_state=42,
-            max_iter="auto", verbose=False,
-        )
-        ica.fit(raw, picks="eeg", verbose=False)
-
-        sources   = ica.get_sources(raw).get_data()
-        eog_data  = raw.get_data(picks=["vEOGt", "vEOGb"])
-        veog_diff = eog_data[0] - eog_data[1]
-
-        corrs = np.array([
-            np.abs(np.corrcoef(sources[i], veog_diff)[0, 1])
-            for i in range(sources.shape[0])
-        ])
-        best = int(np.argmax(corrs))
-        if corrs[best] > ICA_THRESHOLD:
-            ica.exclude = [best]
-            ica.apply(raw, verbose=False)
+               fir_window="hamming", picks="eeg", verbose=False)
+    raw.filter(l_freq=0.5, h_freq=50.0, method="fir",
+               fir_window="hamming", picks="eog", verbose=False)
 
     all_events = mne.find_events(raw, stim_channel="STI",
                                  consecutive=True, min_duration=0.01,
@@ -505,13 +485,25 @@ for subject in SUBJECTS:
 
         print(f"\n  Session: {ses_name}", flush=True)
 
-        X, y, onset_sec = load_session(f)
-        if X is None:
-            print("    skipped (no MI epochs)")
-            continue
+        preproc_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                        / "preprocessed_epochs" / subject / f"{ses_name}_epo.fif")
+        if preproc_file.exists():
+            print(f"    Loading preprocessed epochs: {preproc_file.name}")
+            _epo      = mne.read_epochs(preproc_file, verbose=False)
+            eeg_picks = mne.pick_types(_epo.info, eeg=True, eog=False, stim=False)
+            X         = _epo.get_data(picks=eeg_picks)
+            y         = (_epo.events[:, 2] == 9).astype(int)
+            onset_sec = _epo.events[:, 0] / sfreq
+        else:
+            print("    No preprocessed file found — running filter+ICA")
+            X, y, onset_sec = load_session(f)
+            if X is None:
+                print("    skipped (no MI epochs)")
+                continue
 
         rej_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review" / "epoch_rejection"
                     / subject / f"{ses_name}_bad_epochs.json")
+        print(f"    Rejection file: {rej_file}")
         bad_ch: list[str] = []
         if rej_file.exists():
             with open(rej_file) as fh:
@@ -519,8 +511,11 @@ for subject in SUBJECTS:
             good_mask = np.ones(len(X), dtype=bool)
             good_mask[bad["bad_indices"]] = False
             X, y, onset_sec = X[good_mask], y[good_mask], onset_sec[good_mask]
-            print(f"    Rejection file loaded: {bad['n_bad']} epochs dropped")
+            print(f"    Rejection file loaded: {bad['n_bad']} epochs dropped  "
+                  f"bad_indices={bad['bad_indices']}")
             bad_ch = [ch for ch in bad.get("bad_channels", []) if ch in EEG_CH_NAMES]
+        else:
+            print("    Rejection file NOT found — all epochs kept")
 
         active_eeg_cols = [c for c, name in zip(EEG_CHANNELS, EEG_CH_NAMES)
                            if name not in bad_ch]

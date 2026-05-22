@@ -41,8 +41,6 @@ MI_TMIN, MI_TMAX = 0, 4
 SUBJECT  = "Sub1_data"   # ← change this before running
 SUBJECTS = [SUBJECT]
 
-APPLY_ICA     = True
-ICA_THRESHOLD = 0.3
 
 CSP_COMPONENTS = 4
 
@@ -167,27 +165,9 @@ def load_session(file_path):
     raw.set_montage(montage, on_missing="ignore")
 
     raw.filter(l_freq=6.0, h_freq=45.0, method="fir",
-               fir_window="hamming", verbose=False)
-
-    if APPLY_ICA:
-        ica = mne.preprocessing.ICA(
-            n_components=len(EEG_CHANNELS), random_state=42,
-            max_iter="auto", verbose=False,
-        )
-        ica.fit(raw, picks="eeg", verbose=False)
-
-        sources   = ica.get_sources(raw).get_data()
-        eog_data  = raw.get_data(picks=["vEOGt", "vEOGb"])
-        veog_diff = eog_data[0] - eog_data[1]
-
-        corrs = np.array([
-            np.abs(np.corrcoef(sources[i], veog_diff)[0, 1])
-            for i in range(sources.shape[0])
-        ])
-        best = int(np.argmax(corrs))
-        if corrs[best] > ICA_THRESHOLD:
-            ica.exclude = [best]
-            ica.apply(raw, verbose=False)
+               fir_window="hamming", picks="eeg", verbose=False)
+    raw.filter(l_freq=0.5, h_freq=45.0, method="fir",
+               fir_window="hamming", picks="eog", verbose=False)
 
     all_events = mne.find_events(raw, stim_channel="STI",
                                  consecutive=True, min_duration=0.01,
@@ -254,7 +234,18 @@ for subject in SUBJECTS:
 
         print(f"\n  Session: {ses_name}", flush=True)
 
-        X, y, onset_sec = load_session(f)
+        preproc_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                        / "preprocessed_epochs" / subject / f"{ses_name}_epo.fif")
+        if preproc_file.exists():
+            print(f"    Loading preprocessed epochs: {preproc_file.name}")
+            _epo      = mne.read_epochs(preproc_file, verbose=False)
+            eeg_picks = mne.pick_types(_epo.info, eeg=True, eog=False, stim=False)
+            X         = _epo.get_data(picks=eeg_picks)
+            y         = (_epo.events[:, 2] == 9).astype(int)
+            onset_sec = _epo.events[:, 0] / sfreq
+        else:
+            print("    No preprocessed file found — running filter+ICA")
+            X, y, onset_sec = load_session(f)
         if X is None:
             print("    skipped (no MI epochs)")
             continue

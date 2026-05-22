@@ -45,6 +45,10 @@ COMPARE_SESSIONS = {
 APPLY_ICA     = True
 ICA_THRESHOLD = 0.3
 
+# Trigger-2 windows that start before this offset (seconds from recording start)
+# are treated as noise and ignored.
+MIN_ONSET_SECS = 50.0
+
 BANDS = {
     "Delta":  (1,   4),
     "Theta":  (4,   8),
@@ -121,15 +125,19 @@ def load_resting_state(file_path):
     picks    = mne.pick_types(raw.info, eeg=True, eog=False, stim=False)
     eeg_full = raw.get_data(picks=picks)
 
+    min_onset_samples = int(MIN_ONSET_SECS * sfreq)
+
     changes = np.diff(trigger2_mask.astype(int), prepend=0, append=0)
     starts  = np.where(changes ==  1)[0]
     ends    = np.where(changes == -1)[0]
 
-    segments = [
-        eeg_full[:, s:e]
-        for s, e in zip(starts, ends)
-        if (e - s) >= sfreq
-    ]
+    segments = []
+    for s, e in zip(starts, ends):
+        if (e - s) < sfreq:
+            continue
+        if s < min_onset_samples:
+            continue
+        segments.append(eeg_full[:, s:e])
 
     if not segments:
         return None, None

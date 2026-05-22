@@ -5,9 +5,7 @@
   "bad_indices": [
     0,
     1,
-    2,
-    32,
-    33
+    2
   ],
   "n_bad": 5,
   "bad_channels": []

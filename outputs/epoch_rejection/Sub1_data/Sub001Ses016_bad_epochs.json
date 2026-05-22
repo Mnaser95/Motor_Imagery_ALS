@@ -3,13 +3,6 @@
   "session": "Sub001Ses016",
   "total_epochs": 40,
   "bad_indices": [
-    4,
-    10,
-    13,
-    34,
-    35,
-    36,
-    39
   ],
   "n_bad": 7,
   "bad_channels": []

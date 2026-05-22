@@ -65,8 +65,9 @@ ALSFRS_SCORES = {
     "Sub6_data": 27,
 }
 
-REST_TRIGGER  = 2      # trigger value that marks the resting-state block
-MIN_REST_SEC  = 5.0    # skip session if resting-state segment < this many seconds
+REST_TRIGGER    = 2      # trigger value that marks the resting-state block
+MIN_REST_SEC    = 5.0    # skip session if resting-state segment < this many seconds
+MIN_ONSET_SECS  = 50.0   # ignore trigger-2 samples before this offset from recording start
 
 APPLY_ICA     = True
 ICA_THRESHOLD = 0.3
@@ -258,14 +259,25 @@ def extract_rest_eeg(raw):
     Extract trigger-2 resting-state EEG from a preprocessed Raw object.
     Returns (eeg_rest, rest_dur_s) or (None, 0) if segment is too short.
     """
-    stim      = raw.get_data(picks="stim")[0]
-    rest_mask = (stim == REST_TRIGGER)
-    rest_dur  = int(rest_mask.sum()) / sfreq
+    stim             = raw.get_data(picks="stim")[0]
+    rest_mask        = (stim == REST_TRIGGER)
+    min_onset_samp   = int(MIN_ONSET_SECS * sfreq)
+
+    changes = np.diff(rest_mask.astype(int), prepend=0, append=0)
+    starts  = np.where(changes ==  1)[0]
+    ends    = np.where(changes == -1)[0]
+
+    eeg_full = raw.get_data(picks="eeg")
+    segments = [eeg_full[:, s:e] for s, e in zip(starts, ends) if s >= min_onset_samp]
+
+    if not segments:
+        return None, 0
+
+    eeg_rest = np.concatenate(segments, axis=1)
+    rest_dur = eeg_rest.shape[1] / sfreq
 
     if rest_dur < MIN_REST_SEC:
         return None, 0
-
-    eeg_rest = raw.get_data(picks="eeg")[:, rest_mask]  # (5, n_rest_samples)
     return eeg_rest, rest_dur
 
 # =========================================================
