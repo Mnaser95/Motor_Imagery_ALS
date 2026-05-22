@@ -38,7 +38,7 @@ MI_TMIN, MI_TMAX = 0, 4
 # CONFIGURATION — edit this section before running
 # =========================================================
 
-SUBJECTS  = ["Sub3_data"]   # list of subject folder names to process
+SUBJECTS  = ["Sub1_data", "Sub2_data", "Sub3_data"]   # list of subject folder names to process
 
 EXCLUDE_SESSIONS = {
     "Sub1_data": {},
