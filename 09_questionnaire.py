@@ -3,7 +3,7 @@
 
 For each session:
   1. Load filtered EEG, apply BPF (1-50 Hz) + ICA.
-  2. Extract the resting-state segment (trigger == REST_TRIGGER).
+  2. Load preprocessed resting-state EEG saved by 00_manual_epoch_review.py.
   3. Compute spectral features from the resting-state EEG.
   4. Load the matching pre-session questionnaire (Q/<session_num>.csv).
   5. Encode choice-type answers ordinally.
@@ -65,12 +65,7 @@ ALSFRS_SCORES = {
     "Sub6_data": 27,
 }
 
-REST_TRIGGER    = 2      # trigger value that marks the resting-state block
-MIN_REST_SEC    = 5.0    # skip session if resting-state segment < this many seconds
-MIN_ONSET_SECS  = 50.0   # ignore trigger-2 samples before this offset from recording start
-
-APPLY_ICA     = True
-ICA_THRESHOLD = 0.3
+MIN_REST_SEC  = 5.0    # skip session if resting-state segment < this many seconds
 
 # Frequency bands (Hz)
 BANDS = {
@@ -193,92 +188,41 @@ Q_LABELS: dict[str, str] = {
 }
 
 # =========================================================
-# HELPER: LOAD, FILTER, ICA → shared preprocessed raw
+# HELPER: LOAD PREPROCESSED DATA FROM 00_manual_epoch_review
 # =========================================================
 
-def _preprocess_session(file_path: Path):
-    """
-    Load CSV, build RawArray, apply 1 Hz HPF + 50 Hz notch + ICA.
-    Returns MNE Raw object, or None if no valid trigger column found.
-    """
-    df = pd.read_csv(file_path, comment="#", skipinitialspace=True)
-
-    trigger_col = None
-    for candidate in ["Manual trigger", "Trigger"]:
-        if candidate in df.columns:
-            temp = pd.to_numeric(df[candidate], errors="coerce").fillna(0).astype(int)
-            if temp.sum() > 0:
-                trigger_col = candidate
-                df[candidate] = temp
-                break
-
-    if trigger_col is None:
-        return None
-
-    data_cols = ALL_SIGNAL_CHANNELS + [trigger_col]
-    ch_names  = [CH_MAP[c] for c in ALL_SIGNAL_CHANNELS] + ["STI"]
-    ch_types  = ["eeg"] * 5 + ["eog"] * 2 + ["stim"]
-
-    data = df[data_cols].values.T.astype(float)
-    data[:-1] *= 1e-6
-    data = np.nan_to_num(data)
-
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-    raw  = mne.io.RawArray(data, info, verbose=False)
-
-    montage = mne.channels.make_standard_montage("standard_1020")
-    raw.set_montage(montage, on_missing="ignore")
-
-    raw.filter(l_freq=1.0, h_freq=None, method="fir",
-               fir_window="hamming", verbose=False)
-    raw.notch_filter(freqs=50.0, verbose=False)
-
-    if APPLY_ICA:
-        ica = mne.preprocessing.ICA(
-            n_components=len(EEG_CHANNELS), random_state=42,
-            max_iter="auto", verbose=False,
-        )
-        ica.fit(raw, picks="eeg", verbose=False)
-        sources   = ica.get_sources(raw).get_data()
-        eog_data  = raw.get_data(picks=["vEOGt", "vEOGb"])
-        veog_diff = eog_data[0] - eog_data[1]
-        corrs = np.array([
-            np.abs(np.corrcoef(sources[i], veog_diff)[0, 1])
-            for i in range(sources.shape[0])
-        ])
-        best = int(np.argmax(corrs))
-        if corrs[best] > ICA_THRESHOLD:
-            ica.exclude = [best]
-            ica.apply(raw, verbose=False)
-
-    return raw
-
-
-def extract_rest_eeg(raw):
-    """
-    Extract trigger-2 resting-state EEG from a preprocessed Raw object.
-    Returns (eeg_rest, rest_dur_s) or (None, 0) if segment is too short.
-    """
-    stim             = raw.get_data(picks="stim")[0]
-    rest_mask        = (stim == REST_TRIGGER)
-    min_onset_samp   = int(MIN_ONSET_SECS * sfreq)
-
-    changes = np.diff(rest_mask.astype(int), prepend=0, append=0)
-    starts  = np.where(changes ==  1)[0]
-    ends    = np.where(changes == -1)[0]
-
-    eeg_full = raw.get_data(picks="eeg")
-    segments = [eeg_full[:, s:e] for s, e in zip(starts, ends) if s >= min_onset_samp]
-
-    if not segments:
+def load_rest_data(subject, ses_name):
+    """Load resting-state numpy array saved by 00_manual_epoch_review.py."""
+    rest_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                 / "resting_state" / subject / f"{ses_name}_rest.npy")
+    if not rest_file.exists():
         return None, 0
-
-    eeg_rest = np.concatenate(segments, axis=1)
-    rest_dur = eeg_rest.shape[1] / sfreq
-
+    eeg_data  = np.load(str(rest_file))
+    rest_dur  = eeg_data.shape[1] / sfreq
     if rest_dur < MIN_REST_SEC:
         return None, 0
-    return eeg_rest, rest_dur
+    return eeg_data, rest_dur
+
+
+def load_mi_epochs(subject, ses_name):
+    """Load MI epochs .fif saved by 00_manual_epoch_review.py. Returns None if missing."""
+    epo_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                / "preprocessed_epochs" / subject / f"{ses_name}_epo.fif")
+    if not epo_file.exists():
+        return None
+    return mne.read_epochs(str(epo_file), verbose=False)
+
+
+def load_bad_channels(subject, ses_name):
+    """Return bad EEG channel names saved by 00_manual_epoch_review.py."""
+    import json
+    json_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                 / "epoch_rejection" / subject / f"{ses_name}_bad_epochs.json")
+    if not json_file.exists():
+        return []
+    with open(json_file) as fh:
+        d = json.load(fh)
+    return [ch for ch in d.get("bad_channels", []) if ch in EEG_CH_NAMES]
 
 # =========================================================
 # HELPER: SAMPLE ENTROPY
@@ -308,11 +252,14 @@ def _sample_entropy(x, m=2, r_factor=0.2, max_n=500):
 # HELPER: COMPUTE SPECTRAL FEATURES
 # =========================================================
 
-def compute_features(eeg: np.ndarray) -> dict[str, float]:
+def compute_features(eeg: np.ndarray, ch_names=None) -> dict[str, float]:
     """
-    eeg: (n_channels, n_samples) array, channels in EEG_CH_NAMES order.
+    eeg: (n_channels, n_samples) array.
+    ch_names: list of channel names in the same order as eeg rows (defaults to EEG_CH_NAMES).
     Returns a flat dict of feature_name → float value.
     """
+    if ch_names is None:
+        ch_names = EEG_CH_NAMES
     n_ch, n_samp = eeg.shape
     nperseg = min(sfreq * 4, n_samp)        # 4-s segments if enough data
     freqs, psd = signal.welch(eeg, fs=sfreq, nperseg=nperseg)
@@ -331,28 +278,29 @@ def compute_features(eeg: np.ndarray) -> dict[str, float]:
 
     for band, bp in band_powers.items():
         rel = bp / total_pow
-        for ci, ch in enumerate(EEG_CH_NAMES):
+        for ci, ch in enumerate(ch_names):
             feats[f"{ch}_{band}_power"] = float(rel[ci])
         feats[f"mean_{band}_power"] = float(rel.mean())
 
     # --- Per-band asymmetry: mean of FC (FC2−FC3) and CP (CP2−CP3) log-ratio ---
-    idx = {ch: i for i, ch in enumerate(EEG_CH_NAMES)}
+    idx = {ch: i for i, ch in enumerate(ch_names)}
     eps = 1e-30
     for band, (flo, fhi) in BANDS.items():
         mask = (freqs >= flo) & (freqs < fhi)
         raw_pow = psd[:, mask].mean(axis=1)
-        fc_asym = (np.log(raw_pow[idx["FC2"]] + eps)
-                   - np.log(raw_pow[idx["FC3"]] + eps))
-        cp_asym = (np.log(raw_pow[idx["CP2"]] + eps)
-                   - np.log(raw_pow[idx["CP3"]] + eps))
-        feats[f"mean_{band}_asymmetry"] = float((fc_asym + cp_asym) / 2)
+        fc_asym = (float(np.log(raw_pow[idx["FC2"]] + eps) - np.log(raw_pow[idx["FC3"]] + eps))
+                   if "FC2" in idx and "FC3" in idx else np.nan)
+        cp_asym = (float(np.log(raw_pow[idx["CP2"]] + eps) - np.log(raw_pow[idx["CP3"]] + eps))
+                   if "CP2" in idx and "CP3" in idx else np.nan)
+        parts = [v for v in [fc_asym, cp_asym] if not np.isnan(v)]
+        feats[f"mean_{band}_asymmetry"] = float(np.mean(parts)) if parts else np.nan
 
     # --- Spectral entropy: per channel and mean ---
     ents = []
     for ci in range(n_ch):
         p = psd[ci] / (psd[ci].sum() + eps)
         se = float(-np.sum(p * np.log(p + eps)))
-        feats[f"{EEG_CH_NAMES[ci]}_spectral_entropy"] = se
+        feats[f"{ch_names[ci]}_spectral_entropy"] = se
         ents.append(se)
     feats["mean_spectral_entropy"] = float(np.mean(ents))
 
@@ -377,9 +325,9 @@ def compute_features(eeg: np.ndarray) -> dict[str, float]:
         act  = v_x
         mob  = float(np.sqrt(v_dx  / v_x)   if v_x  > 0 else 0.0)
         cplx = float(np.sqrt(v_ddx / v_dx) / mob if (v_dx > 0 and mob > 0) else 0.0)
-        feats[f"{EEG_CH_NAMES[ci]}_hjorth_activity"]   = float(act)
-        feats[f"{EEG_CH_NAMES[ci]}_hjorth_mobility"]   = mob
-        feats[f"{EEG_CH_NAMES[ci]}_hjorth_complexity"] = cplx
+        feats[f"{ch_names[ci]}_hjorth_activity"]   = float(act)
+        feats[f"{ch_names[ci]}_hjorth_mobility"]   = mob
+        feats[f"{ch_names[ci]}_hjorth_complexity"] = cplx
         h_act.append(act);  h_mob.append(mob);  h_cplx.append(cplx)
     feats["mean_hjorth_activity"]   = float(np.mean(h_act))
     feats["mean_hjorth_mobility"]   = float(np.mean(h_mob))
@@ -389,7 +337,7 @@ def compute_features(eeg: np.ndarray) -> dict[str, float]:
     samp_ents = []
     for ci in range(n_ch):
         se = _sample_entropy(eeg[ci])
-        feats[f"{EEG_CH_NAMES[ci]}_sample_entropy"] = se
+        feats[f"{ch_names[ci]}_sample_entropy"] = se
         samp_ents.append(se)
     feats["mean_sample_entropy"] = float(np.nanmean(samp_ents))
 
@@ -399,69 +347,66 @@ def compute_features(eeg: np.ndarray) -> dict[str, float]:
 # HELPER: ERD / ERS FROM MI EPOCHS
 # =========================================================
 
-def compute_erd_ers(raw) -> dict[str, float]:
+def compute_erd_ers(eeg_rest: np.ndarray, epochs_fif, ch_names=None) -> dict[str, float]:
     """
     Compute average ERD (contralateral) and ERS (ipsilateral) for MI_Left
-    and MI_Right epochs.  Baseline = trigger-2 period (same as resting state).
+    and MI_Right epochs.  Baseline = resting-state numpy array.
     Formula: (A - R) / R * 100  (negative = desynchronisation, positive = sync).
 
-    Returns a dict with 8 keys:
-      ERD/ERS_alpha/beta_MI_Left/Right
-    or an empty dict if baseline or MI epochs are unavailable.
-    """
-    stim     = raw.get_data(picks="stim")[0]
-    eeg_full = raw.get_data(picks="eeg")   # (5, n_samples)
+    ch_names: active channel list for eeg_rest (defaults to EEG_CH_NAMES).
+    Bad channels must already be excluded from eeg_rest and listed in ch_names.
+    The same channels are excluded from the epoch PSD computation so baseline
+    and activation power are always computed over the same set.
 
-    # --- Baseline PSD from trigger-2 period ---
-    rest_mask = (stim == REST_TRIGGER)
-    eeg_rest  = eeg_full[:, rest_mask]
-    if eeg_rest.shape[1] < sfreq:
+    Returns a dict with 8 keys (ERD/ERS_alpha/beta_MI_Left/Right),
+    or an empty dict if baseline or epochs are unavailable.
+    """
+    if ch_names is None:
+        ch_names = EEG_CH_NAMES
+    if eeg_rest is None or eeg_rest.shape[1] < sfreq:
         return {}
 
+    # Hemisphere channels restricted to whichever are still active
+    right_active = [ch for ch in ["CP2", "FC2"] if ch in ch_names]
+    left_active  = [ch for ch in ["CP3", "FC3"] if ch in ch_names]
+    if not right_active or not left_active:
+        return {}
+
+    # Indices into eeg_rest (active channels only)
+    right_rest_idx = [ch_names.index(ch)     for ch in right_active]
+    left_rest_idx  = [ch_names.index(ch)     for ch in left_active]
+    # Indices into epoch data (always full 5-ch from .fif) — same channel subset
+    right_epo_idx  = [EEG_CH_NAMES.index(ch) for ch in right_active]
+    left_epo_idx   = [EEG_CH_NAMES.index(ch) for ch in left_active]
+
+    # --- Baseline PSD from resting-state array ---
     nperseg_rest = min(sfreq * 4, eeg_rest.shape[1])
     freqs_r, psd_rest = signal.welch(eeg_rest, fs=sfreq, nperseg=nperseg_rest)
 
     baseline: dict[tuple, float] = {}
     for band, (flo, fhi) in ERD_ERS_BANDS.items():
         bm = (freqs_r >= flo) & (freqs_r < fhi)
-        baseline[("right", band)] = float(psd_rest[RIGHT_CH_IDX, :][:, bm].mean())
-        baseline[("left",  band)] = float(psd_rest[LEFT_CH_IDX,  :][:, bm].mean())
+        baseline[("right", band)] = float(psd_rest[right_rest_idx, :][:, bm].mean())
+        baseline[("left",  band)] = float(psd_rest[left_rest_idx,  :][:, bm].mean())
 
-    # --- Find MI epochs (same onset-cutoff logic as classify scripts) ---
-    baseline_rows   = np.where(np.isin(stim, [1, 2, 3, 4, 5]))[0]
-    mi_onset_cutoff = int(baseline_rows[-1]) if len(baseline_rows) > 0 else 0
-
-    all_events = mne.find_events(raw, stim_channel="STI",
-                                 consecutive=True, min_duration=0.01,
-                                 verbose=False)
-    mi_events = all_events[
-        np.isin(all_events[:, 2], [8, 9]) &
-        (all_events[:, 0] >= mi_onset_cutoff)
-    ]
-    if len(mi_events) == 0:
+    if epochs_fif is None:
         return {}
 
-    picks_eeg = mne.pick_types(raw.info, eeg=True, eog=False, stim=False)
-    epochs = mne.Epochs(
-        raw, mi_events,
-        event_id={"MI_Left": 8, "MI_Right": 9},
-        tmin=MI_TMIN, tmax=MI_TMAX,
-        baseline=None, picks=picks_eeg,
-        preload=True, verbose=False,
-    )
+    picks_eeg = mne.pick_types(epochs_fif.info, eeg=True, eog=False, stim=False)
+    epochs = epochs_fif
 
     result: dict[str, float] = {}
 
     # MI_Left:  contralateral = right hemisphere,  ipsilateral = left
     # MI_Right: contralateral = left  hemisphere,  ipsilateral = right
     task_cfg = [
-        ("MI_Left",  "right", "left",  RIGHT_CH_IDX, LEFT_CH_IDX),
-        ("MI_Right", "left",  "right", LEFT_CH_IDX,  RIGHT_CH_IDX),
+        ("MI_Left",  "right", "left",  right_epo_idx, left_epo_idx),
+        ("MI_Right", "left",  "right", left_epo_idx,  right_epo_idx),
     ]
 
     for task, contra_hemi, ipsi_hemi, contra_idx, ipsi_idx in task_cfg:
         try:
-            X = epochs[task].get_data()          # (n_epochs, n_ch, n_times)
+            X = epochs[task].get_data(picks=picks_eeg)  # (n_epochs, 5, n_times)
         except KeyError:
             X = np.empty((0,))
 
@@ -571,19 +516,23 @@ for subject in SUBJECTS:
 
         print(f"  {ses_name} ...", end=" ", flush=True)
 
-        # --- EEG: preprocess once, reuse for rest features + ERD/ERS ---
-        raw = _preprocess_session(f)
-        if raw is None:
-            print("skipped (trigger not found)")
-            continue
-
-        eeg_rest, rest_dur = extract_rest_eeg(raw)
+        # --- Load preprocessed data from 00_manual_epoch_review ---
+        eeg_rest, rest_dur = load_rest_data(subject, ses_name)
         if eeg_rest is None:
-            print(f"skipped (resting-state < {MIN_REST_SEC:.0f} s)")
+            print("skipped (run 00_manual_epoch_review.py first)")
             continue
 
-        feats = compute_features(eeg_rest)
-        feats.update(compute_erd_ers(raw))
+        bad_ch = load_bad_channels(subject, ses_name)
+        active_ch_names = [ch for ch in EEG_CH_NAMES if ch not in bad_ch]
+        if bad_ch:
+            keep     = [i for i, ch in enumerate(EEG_CH_NAMES) if ch not in bad_ch]
+            eeg_rest = eeg_rest[keep, :]
+            print(f"[bad ch dropped: {bad_ch}] ", end="")
+
+        epochs_fif = load_mi_epochs(subject, ses_name)
+
+        feats = compute_features(eeg_rest, ch_names=active_ch_names)
+        feats.update(compute_erd_ers(eeg_rest, epochs_fif, ch_names=active_ch_names))
         feats["csp_lda_accuracy_%"] = _acc_lookup.get((subject, ses_name), np.nan)
 
         # --- Questionnaire ---

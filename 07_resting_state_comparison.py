@@ -1,33 +1,14 @@
 from pathlib import Path
 import re
+import json
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-import mne
 from scipy import signal as sp_signal
 from scipy.stats import percentileofscore
 import csv
 
 PROJECT_DIR = Path(__file__).resolve().parent
 sfreq       = 300
-
-# =========================================================
-# CHANNEL DEFINITIONS
-# =========================================================
-
-CH_MAP = {
-    "S1:CZ":    "Cz",
-    "S2:CP2":   "CP2",
-    "S3:CP3":   "CP3",
-    "S4:FC2":   "FC2",
-    "S5:FC3":   "FC3",
-    "S6:vEOGt": "vEOGt",
-    "S7:vEOGb": "vEOGb",
-}
-
-EEG_CHANNELS        = ["S1:CZ", "S2:CP2", "S3:CP3", "S4:FC2", "S5:FC3"]
-EOG_CHANNELS        = ["S6:vEOGt", "S7:vEOGb"]
-ALL_SIGNAL_CHANNELS = EEG_CHANNELS + EOG_CHANNELS
 
 # =========================================================
 # CONFIGURATION — keep in sync with MARKED_SESSIONS in 06
@@ -37,17 +18,13 @@ SUBJECTS = ["Sub1_data", "Sub2_data", "Sub3_data"]
 
 # Sessions compared against the reference (same as MARKED_SESSIONS in script 06)
 COMPARE_SESSIONS = {
-    "Sub1_data": [5, 6, 12],
+    "Sub1_data": [9, 12, 20],
     "Sub2_data": [8],
     "Sub3_data": [14, 15, 19],
 }
 
-APPLY_ICA     = True
-ICA_THRESHOLD = 0.3
-
-# Trigger-2 windows that start before this offset (seconds from recording start)
-# are treated as noise and ignored.
-MIN_ONSET_SECS = 50.0
+MIN_REST_SEC  = 5.0   # skip session if resting-state data is shorter than this
+REST_CH_NAMES = ["Cz", "CP2", "CP3", "FC2", "FC3"]  # fixed order in .npy
 
 BANDS = {
     "Delta":  (1,   4),
@@ -60,95 +37,31 @@ BANDS = {
 COMPARE_PALETTE = ["#E53935", "#1565C0", "#F9A825", "#AB47BC", "#FF7043"]
 
 # =========================================================
-# HELPER: LOAD RESTING-STATE EEG (trigger-2 windows only)
+# HELPER: LOAD PREPROCESSED RESTING-STATE EEG
 # =========================================================
 
-def load_resting_state(file_path):
-    """Extract EEG during all contiguous trigger-2 windows, concatenate them.
-    Returns (eeg_data, total_duration_s) or (None, None) on failure."""
-    df = pd.read_csv(file_path, comment="#", skipinitialspace=True)
-
-    trigger_col = None
-    for candidate in ["Manual trigger", "Trigger"]:
-        if candidate in df.columns:
-            temp = pd.to_numeric(df[candidate], errors="coerce").fillna(0).astype(int)
-            if temp.sum() > 0:
-                trigger_col = candidate
-                df[candidate] = temp
-                break
-
-    if trigger_col is None:
-        return None, None
-
-    trigger       = df[trigger_col].astype(int)
-    trigger2_mask = (trigger == 2).values
-    if trigger2_mask.sum() == 0:
-        return None, None
-
-    data_cols = ALL_SIGNAL_CHANNELS + [trigger_col]
-    ch_names  = [CH_MAP[c] for c in ALL_SIGNAL_CHANNELS] + ["STI"]
-    ch_types  = ["eeg"] * 5 + ["eog"] * 2 + ["stim"]
-
-    data = df[data_cols].values.T.astype(float)
-    data[:-1] *= 1e-6
-    data = np.nan_to_num(data)
-
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-    raw  = mne.io.RawArray(data, info, verbose=False)
-
-    montage = mne.channels.make_standard_montage("standard_1020")
-    raw.set_montage(montage, on_missing="ignore")
-
-    raw.filter(l_freq=1.0, h_freq=45.0, method="fir",
-               fir_window="hamming", verbose=False)
-
-    if APPLY_ICA:
-        ica = mne.preprocessing.ICA(
-            n_components=len(EEG_CHANNELS), random_state=42,
-            max_iter="auto", verbose=False,
-        )
-        ica.fit(raw, picks="eeg", verbose=False)
-
-        sources   = ica.get_sources(raw).get_data()
-        eog_data  = raw.get_data(picks=["vEOGt", "vEOGb"])
-        veog_diff = eog_data[0] - eog_data[1]
-
-        corrs = np.array([
-            np.abs(np.corrcoef(sources[i], veog_diff)[0, 1])
-            for i in range(sources.shape[0])
-        ])
-        best = int(np.argmax(corrs))
-        if corrs[best] > ICA_THRESHOLD:
-            ica.exclude = [best]
-            ica.apply(raw, verbose=False)
-
-    picks    = mne.pick_types(raw.info, eeg=True, eog=False, stim=False)
-    eeg_full = raw.get_data(picks=picks)
-
-    min_onset_samples = int(MIN_ONSET_SECS * sfreq)
-
-    changes = np.diff(trigger2_mask.astype(int), prepend=0, append=0)
-    starts  = np.where(changes ==  1)[0]
-    ends    = np.where(changes == -1)[0]
-
-    segments = []
-    for s, e in zip(starts, ends):
-        if (e - s) < sfreq:
-            continue
-        if s < min_onset_samples:
-            continue
-        segments.append(eeg_full[:, s:e])
-
-    if not segments:
-        return None, None
-
-    eeg_data  = np.concatenate(segments, axis=1)
+def load_rest_data(subject, ses_name):
+    """Load resting-state numpy array saved by 00_manual_epoch_review.py."""
+    rest_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                 / "resting_state" / subject / f"{ses_name}_rest.npy")
+    if not rest_file.exists():
+        return None, 0
+    eeg_data  = np.load(str(rest_file))
     total_dur = eeg_data.shape[1] / sfreq
-
-    if total_dur < 5.0:
-        return None, None
-
+    if total_dur < MIN_REST_SEC:
+        return None, 0
     return eeg_data, total_dur
+
+
+def load_bad_channels(subject, ses_name):
+    """Return bad channel names saved by 00_manual_epoch_review.py, filtered to EEG channels."""
+    json_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
+                 / "epoch_rejection" / subject / f"{ses_name}_bad_epochs.json")
+    if not json_file.exists():
+        return []
+    with open(json_file) as fh:
+        d = json.load(fh)
+    return [ch for ch in d.get("bad_channels", []) if ch in REST_CH_NAMES]
 
 
 # =========================================================
@@ -215,10 +128,16 @@ for subject in SUBJECTS:
         ses_num  = int(m_ses.group(1)) if m_ses else 0
 
         print(f"  {ses_name} ...", end=" ", flush=True)
-        eeg_data, dur = load_resting_state(f)
+        eeg_data, dur = load_rest_data(subject, ses_name)
         if eeg_data is None:
-            print("skipped (insufficient trigger-2 data)")
+            print("skipped (no preprocessed resting-state — run 00_manual_epoch_review.py first)")
             continue
+
+        bad_ch = load_bad_channels(subject, ses_name)
+        if bad_ch:
+            keep     = [i for i, ch in enumerate(REST_CH_NAMES) if ch not in bad_ch]
+            eeg_data = eeg_data[keep, :]
+            print(f"[bad ch dropped: {bad_ch}] ", end="")
 
         feats = compute_features(eeg_data)
         records.append((ses_num, ses_name, feats))

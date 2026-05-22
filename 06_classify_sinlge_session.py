@@ -40,7 +40,7 @@ MI_TMIN, MI_TMAX = 0, 4
 # CONFIGURATION — edit this section before running
 # =========================================================
 
-SUBJECT  = "Sub1_data"   # ← change this before running
+SUBJECT  = "Sub3_data"   # ← change this before running
 SUBJECTS = [SUBJECT]
 
 N_SPLITS    = 5
@@ -61,9 +61,9 @@ QUALITY_EXPONENT = 3
 
 # Sessions shown in black and excluded from group mean calculations.
 MARKED_SESSIONS = {
-    "Sub1_data": {5, 6, 12},
-    "Sub2_data": {8},
-    "Sub3_data": {14, 15, 19},
+    "Sub1_data": {},
+    "Sub2_data": {},
+    "Sub3_data": {},
 }
 
 # =========================================================
@@ -163,72 +163,6 @@ def epoch_quality(z_table, onset_sec, active_ch_cols):
 # HELPER: LOAD SESSION → MI EPOCHS + ONSET TIMES
 # =========================================================
 
-def load_session(file_path):
-    df = pd.read_csv(file_path, comment="#", skipinitialspace=True)
-
-    trigger_col = None
-    for candidate in ["Manual trigger", "Trigger"]:
-        if candidate in df.columns:
-            temp = pd.to_numeric(df[candidate], errors="coerce").fillna(0).astype(int)
-            if temp.sum() > 0:
-                trigger_col = candidate
-                df[candidate] = temp
-                break
-
-    if trigger_col is None:
-        return None, None, None
-
-    trigger = df[trigger_col].astype(int)
-
-    baseline_rows   = trigger[trigger.isin([1, 2, 3, 4, 5])].index
-    mi_onset_cutoff = int(baseline_rows[-1]) if len(baseline_rows) > 0 else 0
-
-    data_cols = ALL_SIGNAL_CHANNELS + [trigger_col]
-    ch_names  = [CH_MAP[c] for c in ALL_SIGNAL_CHANNELS] + ["STI"]
-    ch_types  = ["eeg"] * 5 + ["eog"] * 2 + ["stim"]
-
-    data = df[data_cols].values.T.astype(float)
-    data[:-1] *= 1e-6
-    data = np.nan_to_num(data)
-
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-    raw  = mne.io.RawArray(data, info, verbose=False)
-
-    montage = mne.channels.make_standard_montage("standard_1020")
-    raw.set_montage(montage, on_missing="ignore")
-
-    raw.filter(l_freq=6.0, h_freq=45.0, method="fir",
-               fir_window="hamming", picks="eeg", verbose=False)
-    raw.filter(l_freq=0.5, h_freq=45.0, method="fir",
-               fir_window="hamming", picks="eog", verbose=False)
-
-    all_events = mne.find_events(raw, stim_channel="STI",
-                                 consecutive=True, min_duration=0.01,
-                                 verbose=False)
-
-    mi_events = all_events[
-        np.isin(all_events[:, 2], [8, 9]) &
-        (all_events[:, 0] >= mi_onset_cutoff)
-    ]
-
-    if len(mi_events) == 0:
-        return None, None, None
-
-    picks = mne.pick_types(raw.info, eeg=True, eog=False, stim=False)
-    epochs = mne.Epochs(
-        raw, mi_events,
-        event_id={"MI_Left": 8, "MI_Right": 9},
-        tmin=MI_TMIN, tmax=MI_TMAX,
-        baseline=None, picks=picks,
-        preload=True, verbose=False,
-    )
-
-    X         = epochs.get_data()
-    y         = (epochs.events[:, 2] == 9).astype(int)
-    onset_sec = epochs.events[:, 0] / sfreq
-    return X, y, onset_sec
-
-
 # =========================================================
 # CLASSIFIERS
 # =========================================================
@@ -290,19 +224,14 @@ for subject in SUBJECTS:
 
         preproc_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review"
                         / "preprocessed_epochs" / subject / f"{ses_name}_epo.fif")
-        if preproc_file.exists():
-            print(f"    Loading preprocessed epochs: {preproc_file.name}")
-            _epo      = mne.read_epochs(preproc_file, verbose=False)
-            eeg_picks = mne.pick_types(_epo.info, eeg=True, eog=False, stim=False)
-            X         = _epo.get_data(picks=eeg_picks)
-            y         = (_epo.events[:, 2] == 9).astype(int)
-            onset_sec = _epo.events[:, 0] / sfreq
-        else:
-            print("    No preprocessed file found — running filter+ICA")
-            X, y, onset_sec = load_session(f)
-            if X is None:
-                print("    skipped (no MI epochs)")
-                continue
+        if not preproc_file.exists():
+            print("    skipped (run 00_manual_epoch_review.py first)")
+            continue
+        _epo      = mne.read_epochs(preproc_file, verbose=False)
+        eeg_picks = mne.pick_types(_epo.info, eeg=True, eog=False, stim=False)
+        X         = _epo.get_data(picks=eeg_picks)
+        y         = (_epo.events[:, 2] == 9).astype(int)
+        onset_sec = _epo.events[:, 0] / sfreq
 
         # --- Epoch rejection ---
         rejection_file = (PROJECT_DIR / "outputs" / "00_manual_epoch_review" / "epoch_rejection"
